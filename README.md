@@ -74,3 +74,23 @@ Main menu আসবে তিনটি বাটন সহ:
 - শুধুমাত্র **Owner** ব্যবহার করতে পারবে
 - Account data `accounts.json` ফাইলে সেভ হয় (Railway volume বা persistent storage ব্যবহার করুন)
 - Live join করার পর admin unmute করলেও account নিজে থেকে **muted** থাকবে
+
+
+## Live Join stability patch (muted mode)
+
+This revision removes the fabricated WebRTC payload and the loop that sent a
+new `JoinGroupCallRequest` every four seconds. It uses the `tgcalls` engine to
+create the join payload and manages leaving through the engine.
+
+Railway setup:
+- Set `BOT_TOKEN`, `OWNER_ID`, `API_ID`, and `API_HASH` as Variables.
+- Deploy from the repository root so Nixpacks reads `nixpacks.toml`.
+- Keep the generated account/session file on persistent storage if you need
+  sessions to survive redeploys. Railway's ephemeral filesystem can be reset.
+- Check Deploy Logs if the native `tgcalls` dependency fails to install or a
+  group call cannot be joined.
+
+This patch has not been verified against your specific Telegram account,
+target chat, or Railway deployment. Telegram can still reject a join or
+disconnect a client; no code can guarantee that every account remains in a
+call indefinitely.

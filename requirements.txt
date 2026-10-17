@@ -1,2 +1,3 @@
 python-telegram-bot==21.6
 telethon==1.34.0
+tgcalls[telethon]==3.0.0
