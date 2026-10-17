@@ -42,6 +42,9 @@ API_ID        = int(os.environ.get("API_ID", "0"))
 API_HASH      = os.environ.get("API_HASH", "")
 ACCOUNTS_FILE = "accounts.json"
 
+# Live-তে auto-leave ঠেকাতে keep-alive ping interval (second)
+KEEPALIVE_INTERVAL = float(os.environ.get("KEEPALIVE_INTERVAL", "4"))
+
 # ─── STATES ────────────────────────────────────────────────────────────────────
 MAIN_MENU, WAIT_PHONE, WAIT_CODE, WAIT_2FA, WAIT_LINK, WAIT_COUNT = range(6)
 
@@ -61,6 +64,7 @@ pending_clients = {}  # phone → client (login চলাকালীন)
 active_clients  = {}  # phone → client (ready)
 live_sessions   = {}  # chat_id → session info
 live_handlers   = {}  # phone → [handler functions]
+keepalive_tasks = {}  # phone → asyncio.Task (4-sec ping, live টিকিয়ে রাখে)
 
 # ─── HELPERS ───────────────────────────────────────────────────────────────────
 def main_kb():
@@ -314,15 +318,7 @@ async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await client(JoinGroupCallRequest(
                 call=call,
                 join_as=await client.get_me(),
-                params=DataJSON(data=json.dumps({
-                    "ufrag": f"uf{ssrc}",
-                    "pwd":   f"pw{ssrc}",
-                    "fingerprints": [],
-                    "ssrc": ssrc,
-                    "ssrc-groups": [],
-                    "payload-types": [],
-                    "rtp-hdrexts": []
-                })),
+                params=DataJSON(data=_join_params(ssrc)),
                 muted=True,
                 video_stopped=True,
             ))
@@ -332,6 +328,9 @@ async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             handler = _make_remute_handler(client, call, me.id)
             client.add_event_handler(handler, events.Raw(UpdateGroupCallParticipants))
             live_handlers.setdefault(phone, []).append(handler)
+
+            # ── Step 5: Keep-alive ping (প্রতি 4 সেকেন্ড) ──────────────
+            _start_keepalive(phone, client, call, ssrc, me)
 
             calls_map[phone] = call
             joined.append(phone)
@@ -355,6 +354,7 @@ async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     live_sessions[chat_id] = {
         "phones": joined,
         "calls":  calls_map,
+        "ssrcs":  ssrc_map,
         "link":   link,
     }
 
@@ -431,6 +431,60 @@ def _make_remute_handler(client: TelegramClient, call, me_id: int):
                     logging.warning(f"[AUTO-MUTE] Failed for {me_id}: {ex}")
     return handler
 
+# ─── KEEP-ALIVE PING (auto-leave ঠেকাতে) ──────────────────────────────────────
+def _join_params(ssrc: int) -> str:
+    return json.dumps({
+        "ufrag": f"uf{ssrc}",
+        "pwd":   f"pw{ssrc}",
+        "fingerprints": [],
+        "ssrc": ssrc,
+        "ssrc-groups": [],
+        "payload-types": [],
+        "rtp-hdrexts": []
+    })
+
+async def _keepalive_loop(phone: str, client: TelegramClient, call, ssrc: int, join_as):
+    """
+    প্রতি KEEPALIVE_INTERVAL (ডিফল্ট 4) সেকেন্ড পর পর আবার Join request পাঠায়।
+    এতে সার্ভার participant কে auto-remove করতে পারে না → live-এ থেকে যায়।
+    """
+    logging.info(f"[KEEPALIVE] {phone} ping started (every {KEEPALIVE_INTERVAL}s)")
+    while True:
+        try:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            if not client.is_connected():
+                await client.connect()
+            await client(JoinGroupCallRequest(
+                call=call,
+                join_as=join_as,
+                params=DataJSON(data=_join_params(ssrc)),
+                muted=True,
+                video_stopped=True,
+            ))
+        except asyncio.CancelledError:
+            logging.info(f"[KEEPALIVE] {phone} ping stopped")
+            raise
+        except FloodWaitError as e:
+            logging.warning(f"[KEEPALIVE] {phone} FloodWait {e.seconds}s")
+            try:
+                await asyncio.sleep(e.seconds + 1)
+            except asyncio.CancelledError:
+                raise
+        except Exception as e:
+            logging.warning(f"[KEEPALIVE] {phone} ping failed: {e}")
+            # একটু বাদ দিয়ে আবার চেষ্টা করবে, loop কখনো বন্ধ হবে না
+
+def _start_keepalive(phone: str, client: TelegramClient, call, ssrc: int, join_as):
+    _stop_keepalive(phone)
+    keepalive_tasks[phone] = asyncio.create_task(
+        _keepalive_loop(phone, client, call, ssrc, join_as)
+    )
+
+def _stop_keepalive(phone: str):
+    task = keepalive_tasks.pop(phone, None)
+    if task and not task.done():
+        task.cancel()
+
 # ─── LIVE LEAVE CALLBACK ────────────────────────────────────────────────────────
 async def live_leave_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -451,8 +505,11 @@ async def live_leave_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     left = 0
     accs = load_accounts()
+    ssrcs = session.get("ssrcs", {})
 
     for phone in session["phones"]:
+        # আগেই keep-alive ping বন্ধ করো, নাহলে leave করার পরেও আবার join করবে
+        _stop_keepalive(phone)
         call = session["calls"].get(phone)
         info = accs.get(phone)
         if not info or not call:
@@ -466,7 +523,7 @@ async def live_leave_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
             # Leave the call
-            await client(LeaveGroupCallRequest(call=call, source=0))
+            await client(LeaveGroupCallRequest(call=call, source=ssrcs.get(phone, 0)))
             left += 1
         except Exception as e:
             logging.error(f"[LEAVE] {phone}: {e}")
@@ -514,7 +571,12 @@ async def main():
             allowed_updates=Update.ALL_TYPES,
         )
         print("✅ Bot is running! Press Ctrl+C to stop.")
-        await asyncio.Event().wait()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            # বন্ধ হওয়ার সময় সব ping task বন্ধ
+            for ph in list(keepalive_tasks):
+                _stop_keepalive(ph)
 
 if __name__ == "__main__":
     asyncio.run(main())
