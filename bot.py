@@ -455,7 +455,7 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 # ─── BUILD & RUN ──────────────────────────────────────────────────────────────
-def main():
+async def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -488,7 +488,12 @@ def main():
     app.add_handler(CallbackQueryHandler(live_leave_callback, pattern=r"^live_leave:"))
 
     print("🤖 Bot started...")
-    app.run_polling(drop_pending_updates=True)
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        print("✅ Polling started. Press Ctrl+C to stop.")
+        await asyncio.Event().wait()  # Run forever until killed
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
