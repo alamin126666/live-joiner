@@ -6,7 +6,7 @@ import random
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton, constants
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -19,12 +19,15 @@ from telethon.errors import (
     PhoneCodeExpiredError, FloodWaitError
 )
 from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
-from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+from telethon.tl.functions.messages import (
+    CheckChatInviteRequest, ImportChatInviteRequest, GetFullChatRequest
+)
 from telethon.tl.functions.phone import (
     JoinGroupCallRequest, LeaveGroupCallRequest, EditGroupCallParticipantRequest
 )
 from telethon.tl.types import (
-    DataJSON, InputPeerSelf, UpdateGroupCallParticipants
+    DataJSON, InputPeerSelf, UpdateGroupCallParticipants,
+    Channel, Chat as TelegramChat
 )
 
 logging.basicConfig(
@@ -283,8 +286,22 @@ async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 continue
 
             # ── Step 2: Get active group call ──────────────────────────
-            full = await client(GetFullChannelRequest(entity))
-            call = getattr(full.full_chat, 'call', None)
+            # Channel vs Group এর জন্য আলাদা request
+            try:
+                if isinstance(entity, Channel):
+                    full = await client(GetFullChannelRequest(entity))
+                else:
+                    # Regular group/supergroup
+                    full = await client(GetFullChatRequest(entity.id))
+                call = getattr(full.full_chat, 'call', None)
+            except Exception as e:
+                logging.warning(f"[{phone}] Could not get full chat: {e}")
+                # Fallback: try the other request type
+                try:
+                    full = await client(GetFullChatRequest(entity.id))
+                    call = getattr(full.full_chat, 'call', None)
+                except Exception:
+                    call = None
 
             if call is None:
                 logging.warning(f"[{phone}] No active voice/live chat at {link}")
@@ -488,8 +505,14 @@ async def main():
     print("🤖 Bot starting...")
     async with app:
         await app.initialize()
+        # পুরনো webhook ও pending updates পরিষ্কার করো
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        await asyncio.sleep(1)  # পুরনো instance বন্ধ হওয়ার জন্য অপেক্ষা
         await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
+        await app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
         print("✅ Bot is running! Press Ctrl+C to stop.")
         await asyncio.Event().wait()
 
