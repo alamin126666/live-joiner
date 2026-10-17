@@ -1,12 +1,24 @@
-# 🤖 Telegram Live Join Bot
+# 🤖 Telegram Live Join Bot (PyTgCalls Edition)
 
 ## ✅ Features
 - Multiple Telegram account add/login (Telethon)
 - Account list view
-- Live join with selected number of accounts (joined **muted** automatically)
+- Live join with **real UDP stream** via PyTgCalls
+- **Always থাকে** — কোনো ping বা loop নেই
+- Admin unmute করলেও muted থাকে
 - Live leave with one button click
 - Owner-only access
 - Runs on Railway
+
+---
+
+## 🔧 কেন PyTgCalls?
+
+| আগে (Telethon only) | এখন (PyTgCalls) |
+|---|---|
+| Fake ping দিতে হতো | Real UDP stream |
+| Telegram auto-remove করতো | সার্ভার মনে করে real user |
+| বারবার request | একবার join, সবসময় থাকে |
 
 ---
 
@@ -29,7 +41,7 @@
 
 ### Step 4 — Railway তে Deploy করুন
 1. [railway.app](https://railway.app) এ যান → New Project
-2. **Deploy from GitHub repo** বেছে নিন (অথবা "Deploy from local" দিয়ে এই folder আপলোড করুন)
+2. **Deploy from GitHub repo** বেছে নিন
 3. **Variables** সেকশনে গিয়ে এই 4টি variable যোগ করুন:
 
 | Variable   | Value                          |
@@ -40,6 +52,9 @@
 | API_HASH   | my.telegram.org থেকে         |
 
 4. Deploy করুন → **Worker** service হিসেবে চলবে
+
+> ⚠️ nixpacks.toml এ `ffmpeg` automatically install হবে।
+> Bot প্রথমবার start হলে `silent.raw` file তৈরি করবে — এটা normal।
 
 ---
 
@@ -65,32 +80,13 @@ Main menu আসবে তিনটি বাটন সহ:
 ### 🟢 Join On Live
 1. Live link দিন (যেমন: `@channelname`)
 2. কতটি account join করাবেন বলুন
-3. সব account **muted** হয়ে join করবে
+3. সব account real UDP stream দিয়ে join করবে
 4. **🔴 LIVE LEAVE** বাটন চাপলে সব account leave করবে
 
 ---
 
 ## ⚠️ গুরুত্বপূর্ণ নোট
 - শুধুমাত্র **Owner** ব্যবহার করতে পারবে
-- Account data `accounts.json` ফাইলে সেভ হয় (Railway volume বা persistent storage ব্যবহার করুন)
-- Live join করার পর admin unmute করলেও account নিজে থেকে **muted** থাকবে
-
-
-## Live Join stability patch (muted mode)
-
-This revision removes the fabricated WebRTC payload and the loop that sent a
-new `JoinGroupCallRequest` every four seconds. It uses the `tgcalls` engine to
-create the join payload and manages leaving through the engine.
-
-Railway setup:
-- Set `BOT_TOKEN`, `OWNER_ID`, `API_ID`, and `API_HASH` as Variables.
-- Deploy from the repository root so Nixpacks reads `nixpacks.toml`.
-- Keep the generated account/session file on persistent storage if you need
-  sessions to survive redeploys. Railway's ephemeral filesystem can be reset.
-- Check Deploy Logs if the native `tgcalls` dependency fails to install or a
-  group call cannot be joined.
-
-This patch has not been verified against your specific Telegram account,
-target chat, or Railway deployment. Telegram can still reject a join or
-disconnect a client; no code can guarantee that every account remains in a
-call indefinitely.
+- Account data `accounts.json` ফাইলে সেভ হয়
+- `silent.raw` file bot নিজেই তৈরি করে — manually করতে হবে না
+- Live join করার পর admin unmute করলেও account **muted** থাকবে
