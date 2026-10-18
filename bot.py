@@ -460,12 +460,47 @@ def _make_remute_handler(client: TelegramClient, call, me_id: int, phone: str = 
     return handler
 
 # ─── REAL UDP CALL ENGINE (আসল human-এর মতো live-এ থাকে) ───────────────────────
+SILENCE_FILE = "silence.wav"
+
+def _ensure_silence() -> str:
+    """Engine-এ আসল media path চালু রাখার জন্য silent audio file (৬০ সেকেন্ড)"""
+    try:
+        if not os.path.exists(SILENCE_FILE):
+            import wave
+            with wave.open(SILENCE_FILE, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(8000)
+                w.writeframes(b"\x00\x00" * 8000 * 60)   # ১ মিনিট নীরব audio
+    except Exception as e:
+        logging.warning(f"[SILENCE] {e}")
+    return SILENCE_FILE
+
+def _tg_filter_stream_end():
+    from pytgcalls import filters as tg_filters
+    return tg_filters.stream_end()
+
+def _register_stream_loop(engine: PyTgCalls, phone: str):
+    """Silent stream শেষ হলে নিজে থেকেই আবার চালু করবে (loop)"""
+    sil = _ensure_silence()
+
+    @engine.on_update(_tg_filter_stream_end())
+    async def _on_stream_end(c, update):
+        try:
+            await asyncio.sleep(2)   # hot loop এড়াতে
+            await c.play(update.chat_id, sil,
+                         config=GroupCallConfig(auto_start=False))
+            logging.info(f"[{phone}] 🔄 silent stream আবার চালু")
+        except Exception as e:
+            logging.warning(f"[{phone}] stream replay: {e}")
+
 async def _get_engine(phone: str, client: TelegramClient) -> PyTgCalls:
     """প্রতিটি account-এর জন্য একটি করে ntgcalls engine (real WebRTC/UDP)"""
     eng = call_engines.get(phone)
     if eng is None:
         eng = PyTgCalls(client, workers=2)
         call_engines[phone] = eng
+        _register_stream_loop(eng, phone)
     if not eng._is_running:
         await eng.start()
     return eng
@@ -473,7 +508,10 @@ async def _get_engine(phone: str, client: TelegramClient) -> PyTgCalls:
 async def _engine_join(phone: str, engine: PyTgCalls, chat_id: int,
                        call, me, client: TelegramClient):
     """Real UDP/WebRTC connection দিয়ে live-এ ঢোকায় (muted থাকে)"""
-    await engine.play(chat_id, None, config=GroupCallConfig(auto_start=False))
+    sil = _ensure_silence()
+    # join_as সবসময় স্পষ্ট দিন — না দিলে cache clear হলে NoneType error আসে
+    await engine.play(chat_id, sil,
+                      config=GroupCallConfig(join_as=me, auto_start=False))
     try:
         await engine.mute(chat_id)              # মাইক বন্ধ
     except Exception as e:
@@ -485,40 +523,50 @@ async def _engine_join(phone: str, engine: PyTgCalls, chat_id: int,
         logging.warning(f"[{phone}] mtproto mute: {e}")
     logging.info(f"[{phone}] ✅ ঢুকেছে REAL UDP call-এ (muted)")
 
-async def _conn_ok(engine: PyTgCalls, chat_id: int) -> bool:
-    """engine এখনো call-এ আছে কিনা (UDP connection সহ)"""
+async def _conn_state(engine: PyTgCalls, chat_id: int):
+    """(in_call, state_name) — engine call-এ আছে কিনা আর connection state"""
     try:
-        if chat_id not in await engine._binding.calls():
-            return False
+        in_call = chat_id in await engine._binding.calls()
+        if not in_call:
+            return False, "NOT_IN_CALL"
         st = engine._binding.get_state(chat_id)
         if asyncio.iscoroutine(st) or hasattr(st, "__await__"):
             st = await st
-        return "CONNECT" in str(getattr(st, "name", st)).upper()
+        return True, str(getattr(st, "name", st)).upper()
     except Exception:
-        return True   # যাচাই করতে না পারলে হস্তক্ষেপ করবে না
+        return True, "UNKNOWN"   # যাচাই করতে না পারলে হস্তক্ষেপ করবে না
 
 async def _watchdog_loop(phone: str, state: dict):
     """
     প্রতি KEEPALIVE_INTERVAL (ডিফল্ট 4) সেকেন্ড পর পর চেক করে —
     connection drop হলে নিজে থেকেই আবার live-এ ঢুকে দেয়।
     """
-    checks = 0
+    checks  = 0
+    fails   = 0
     logging.info(f"[WATCHDOG] {phone} 🟢 started (every {KEEPALIVE_INTERVAL}s)")
     while True:
         try:
             await asyncio.sleep(KEEPALIVE_INTERVAL)
-            if await _conn_ok(state["engine"], state["chat_id"]):
+            in_call, st_name = await _conn_state(state["engine"], state["chat_id"])
+            if in_call and ("CONNECT" in st_name or st_name == "UNKNOWN"):
                 checks += 1
                 if checks % 15 == 0:  # ~1 মিনিট পর confirmation
                     logging.info(f"[WATCHDOG] {phone} ✅ live-এ আছে ({checks} checks)")
                 continue
-            logging.warning(f"[WATCHDOG] {phone} 🔄 connection গেছে → আবার join হচ্ছে")
-            try:
-                await state["engine"].leave_call(state["chat_id"])
-            except Exception:
-                pass
+
+            logging.warning(
+                f"[WATCHDOG] {phone} 🔄 connection গেছে "
+                f"(in_call={in_call}, state={st_name}) → আবার join হচ্ছে"
+            )
+            if in_call:
+                try:
+                    await state["engine"].leave_call(state["chat_id"])
+                except Exception:
+                    pass
+                await asyncio.sleep(1)  # callback settle হওয়ার জন্য
             await _engine_join(phone, state["engine"], state["chat_id"],
                                state["call"], state["me"], state["client"])
+            fails = 0
         except asyncio.CancelledError:
             logging.info(f"[WATCHDOG] {phone} ⛔ stopped")
             raise
@@ -526,9 +574,11 @@ async def _watchdog_loop(phone: str, state: dict):
             logging.warning(f"[WATCHDOG] {phone} ⛔ live শেষ (call নেই) → watchdog বন্ধ")
             break
         except Exception as e:
-            logging.warning(f"[WATCHDOG] {phone} ⚠️ {e}")
+            fails += 1
+            logging.exception(f"[WATCHDOG] {phone} ⚠️ rejoin failed ({fails}x)")
+            # বারবার fail হলে ধীরে ধীরে বেশি অপেক্ষা (flood এড়াতে)
             try:
-                await asyncio.sleep(KEEPALIVE_INTERVAL)
+                await asyncio.sleep(min(KEEPALIVE_INTERVAL * (2 ** fails), 60))
             except asyncio.CancelledError:
                 raise
 
