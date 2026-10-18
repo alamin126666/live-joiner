@@ -284,6 +284,7 @@ async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     joined    = []
     calls_map = {}
+    errors    = []
 
     for phone in phones:
         info = accs.get(phone)
@@ -295,6 +296,7 @@ async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             entity = await _resolve_and_join(client, link)
             if entity is None:
                 logging.warning(f"[{phone}] Could not resolve entity for {link}")
+                errors.append("Link/invite resolve হয়নি (link ভুল অথবা access নেই)")
                 continue
 
             # ── Step 2: Get active group call ──────────────────────────
@@ -317,6 +319,11 @@ async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             if call is None:
                 logging.warning(f"[{phone}] No active voice/live chat at {link}")
+                errors.append(
+                    "এখন কোনো চলমান live/voice chat নেই "
+                    "(live শেষ হয়ে গেছে অথবা scheduled আছে) — "
+                    "আগে live চালু করে তারপর join দিন"
+                )
                 continue
 
             # ── Step 3: Real UDP/WebRTC দিয়ে live join (যেমন আসল human) ─
@@ -346,16 +353,17 @@ async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             joined.append(phone)
             logging.info(f"[{phone}] ✅ Joined live via REAL UDP engine")
 
+        except NoActiveGroupCall:
+            logging.error(f"[{phone}] NoActiveGroupCall (live চালু নেই)")
+            errors.append(f"{phone}: Live call পাওয়া যায়নি — লাইভ চালু আছে কিনা দেখুন")
         except Exception as e:
-            logging.error(f"[{phone}] Live join failed: {e}")
+            logging.exception(f"[{phone}] Live join failed")
+            errors.append(f"{phone}: {type(e).__name__}: {e}")
 
     if not joined:
+        detail = "\n".join(f"• {x}" for x in dict.fromkeys(errors)) or "• অজানা কারণ"
         await msg.edit_text(
-            "❌ *Join করা সম্ভব হয়নি।*\n\n"
-            "সম্ভাব্য কারণ:\n"
-            "• Channel এ Active voice/live chat নেই\n"
-            "• Link ভুল অথবা access নেই",
-            parse_mode="Markdown",
+            "❌ Join করা সম্ভব হয়নি।\n\n🔎 আসল কারণ:\n" + detail,
             reply_markup=InlineKeyboardMarkup([[]])
         )
         await update.message.reply_text("Main menu 👇", reply_markup=main_kb())
@@ -377,6 +385,11 @@ async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔴 LIVE LEAVE", callback_data=f"leave:{chat_id}")
         ]])
     )
+    if count > len(joined) and errors:
+        uniq = list(dict.fromkeys(errors))[:4]
+        await update.message.reply_text(
+            "⚠️ যেসব account join হয়নি — কারণ:\n" + "\n".join(f"• {x}" for x in uniq)
+        )
     return MAIN_MENU
 
 async def _resolve_and_join(client: TelegramClient, link: str):
