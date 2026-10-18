@@ -476,19 +476,30 @@ def _ensure_silence() -> str:
         logging.warning(f"[SILENCE] {e}")
     return SILENCE_FILE
 
+def _silence_stream():
+    """Raw stream — ffprobe/ffmpeg বাইরে লাগে না, ntgcalls নিজের ভেতরের
+    decoder দিয়ে ফাইল পড়ে (MediaSource.FILE)"""
+    from pytgcalls.types.raw import Stream, AudioStream, AudioParameters
+    from ntgcalls import MediaSource
+    return Stream(
+        microphone=AudioStream(
+            MediaSource.FILE, _ensure_silence(),
+            AudioParameters(bitrate=48000, channels=1),
+        )
+    )
+
 def _tg_filter_stream_end():
     from pytgcalls import filters as tg_filters
     return tg_filters.stream_end()
 
 def _register_stream_loop(engine: PyTgCalls, phone: str):
     """Silent stream শেষ হলে নিজে থেকেই আবার চালু করবে (loop)"""
-    sil = _ensure_silence()
 
     @engine.on_update(_tg_filter_stream_end())
     async def _on_stream_end(c, update):
         try:
             await asyncio.sleep(2)   # hot loop এড়াতে
-            await c.play(update.chat_id, sil,
+            await c.play(update.chat_id, _silence_stream(),
                          config=GroupCallConfig(auto_start=False))
             logging.info(f"[{phone}] 🔄 silent stream আবার চালু")
         except Exception as e:
@@ -508,10 +519,15 @@ async def _get_engine(phone: str, client: TelegramClient) -> PyTgCalls:
 async def _engine_join(phone: str, engine: PyTgCalls, chat_id: int,
                        call, me, client: TelegramClient):
     """Real UDP/WebRTC connection দিয়ে live-এ ঢোকায় (muted থাকে)"""
-    sil = _ensure_silence()
     # join_as সবসময় স্পষ্ট দিন — না দিলে cache clear হলে NoneType error আসে
-    await engine.play(chat_id, sil,
-                      config=GroupCallConfig(join_as=me, auto_start=False))
+    try:
+        # raw stream — ffprobe/ffmpeg লাগে না (ntgcalls নিজে ফাইল পড়ে, loop করে)
+        await engine.play(chat_id, _silence_stream(),
+                          config=GroupCallConfig(join_as=me, auto_start=False))
+    except Exception as e:
+        logging.warning(f"[{phone}] silent stream failed ({e}) → media ছাড়া join")
+        await engine.play(chat_id, None,
+                          config=GroupCallConfig(join_as=me, auto_start=False))
     try:
         await engine.mute(chat_id)              # মাইক বন্ধ
     except Exception as e:
