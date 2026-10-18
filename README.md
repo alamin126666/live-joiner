@@ -1,24 +1,12 @@
-# 🤖 Telegram Live Join Bot (PyTgCalls Edition)
+# 🤖 Telegram Live Join Bot
 
 ## ✅ Features
 - Multiple Telegram account add/login (Telethon)
 - Account list view
-- Live join with **real UDP stream** via PyTgCalls
-- **Always থাকে** — কোনো ping বা loop নেই
-- Admin unmute করলেও muted থাকে
+- Live join with selected number of accounts (joined **muted** automatically)
 - Live leave with one button click
 - Owner-only access
 - Runs on Railway
-
----
-
-## 🔧 কেন PyTgCalls?
-
-| আগে (Telethon only) | এখন (PyTgCalls) |
-|---|---|
-| Fake ping দিতে হতো | Real UDP stream |
-| Telegram auto-remove করতো | সার্ভার মনে করে real user |
-| বারবার request | একবার join, সবসময় থাকে |
 
 ---
 
@@ -41,7 +29,7 @@
 
 ### Step 4 — Railway তে Deploy করুন
 1. [railway.app](https://railway.app) এ যান → New Project
-2. **Deploy from GitHub repo** বেছে নিন
+2. **Deploy from GitHub repo** বেছে নিন (অথবা "Deploy from local" দিয়ে এই folder আপলোড করুন)
 3. **Variables** সেকশনে গিয়ে এই 4টি variable যোগ করুন:
 
 | Variable   | Value                          |
@@ -52,9 +40,6 @@
 | API_HASH   | my.telegram.org থেকে         |
 
 4. Deploy করুন → **Worker** service হিসেবে চলবে
-
-> ⚠️ nixpacks.toml এ `ffmpeg` automatically install হবে।
-> Bot প্রথমবার start হলে `silent.raw` file তৈরি করবে — এটা normal।
 
 ---
 
@@ -80,13 +65,27 @@ Main menu আসবে তিনটি বাটন সহ:
 ### 🟢 Join On Live
 1. Live link দিন (যেমন: `@channelname`)
 2. কতটি account join করাবেন বলুন
-3. সব account real UDP stream দিয়ে join করবে
+3. প্রতিটি account **আসল UDP/WebRTC media connection** দিয়ে join করবে (ntgcalls engine — ঠিক যেমন Telegram app করে), সাথে **muted** থাকবে
 4. **🔴 LIVE LEAVE** বাটন চাপলে সব account leave করবে
+
+---
+
+## 🛠️ কীভাবে auto-leave ঠেকানো হয়েছে
+- পুরনো উপায়ে (শুধু fake join request) সার্ভার কিছুক্ষণ পর account বের করে দিচ্ছিল
+- এখন **py-tgcalls (ntgcalls)** ব্যবহার হয় — প্রতিটি account আসল ধরনের call connection রাখে, তাই real human-এর মতো লিস্টে থেকে যায়
+- সাথে **৪ সেকেন্ড** পর পর watchdog চেক করে, connection গেলে নিজে থেকেই আবার ঢুকে দেয়
+- admin unmute করলেও account নিজে থেকেই **muted** হয়ে যাবে
+
+**লগে যা দেখবেন:**
+- `[WATCHDOG] +8801... 🟢 started (every 4.0s)`
+- `[WATCHDOG] +8801... ✅ live-এ আছে (15 checks)` → প্রতি ~১ মিনিট
+- `[WATCHDOG] +8801... 🔄 connection গেছে → আবার join হচ্ছে` → কখনো drop হলে নিজে থেকেই ফিরে আসবে
 
 ---
 
 ## ⚠️ গুরুত্বপূর্ণ নোট
 - শুধুমাত্র **Owner** ব্যবহার করতে পারবে
-- Account data `accounts.json` ফাইলে সেভ হয়
-- `silent.raw` file bot নিজেই তৈরি করে — manually করতে হবে না
-- Live join করার পর admin unmute করলেও account **muted** থাকবে
+- Account data `accounts.json` ফাইলে সেভ হয় (Railway volume বা persistent storage ব্যবহার করুন)
+- Live join করার পর admin unmute করলেও account নিজে থেকে **muted** থাকবে
+- Account live-এ যতক্ষণ থাকবে ততক্ষণ **আসল UDP call connection** চালু থাকবে (auto-leave হবে না)
+- একই সাথে অনেক account ধরে রাখলে Railway-এর RAM/CPU বেশি লাগে — দরকার হলে plan বাড়িয়ে নিন

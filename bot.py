@@ -2,31 +2,40 @@ import os
 import asyncio
 import json
 import logging
-import subprocess
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton, constants
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, ConversationHandler, filters
 )
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.utils import get_peer_id
 from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError,
     PhoneCodeExpiredError, FloodWaitError
 )
-from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
 from telethon.tl.functions.messages import (
-    CheckChatInviteRequest, ImportChatInviteRequest
+    CheckChatInviteRequest, ImportChatInviteRequest, GetFullChatRequest
+)
+from telethon.tl.functions.phone import (
+    LeaveGroupCallRequest, EditGroupCallParticipantRequest
+)
+from telethon.tl.types import (
+    InputPeerSelf, UpdateGroupCallParticipants,
+    Channel, Chat as TelegramChat
 )
 
+# ─── REAL UDP CALL ENGINE ────────────────────────────────────────────────────────
+# আসল human app যেমন Telegram-এর WebRTC (UDP) দিয়ে call-এ থাকে,
+# ঠিক সেভাবেই ntgcalls দিয়ে প্রতিটি account আসল media connection রাখবে
 from pytgcalls import PyTgCalls
-from pytgcalls.types import Update as CallUpdate, StreamType
-from pytgcalls.types.input_stream import AudioPiped
-from pytgcalls.types.input_stream.quality import AudioQuality
+from pytgcalls.types import GroupCallConfig
+from pytgcalls.exceptions import NoActiveGroupCall, NotInCallError
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -39,36 +48,12 @@ OWNER_ID      = int(os.environ.get("OWNER_ID", "0"))
 API_ID        = int(os.environ.get("API_ID", "0"))
 API_HASH      = os.environ.get("API_HASH", "")
 ACCOUNTS_FILE = "accounts.json"
-SILENT_AUDIO  = "silent.raw"   # ffmpeg দিয়ে তৈরি করা হবে
+
+# Live-তে auto-leave ঠেকাতে keep-alive ping interval (second)
+KEEPALIVE_INTERVAL = float(os.environ.get("KEEPALIVE_INTERVAL", "4"))
 
 # ─── STATES ────────────────────────────────────────────────────────────────────
 MAIN_MENU, WAIT_PHONE, WAIT_CODE, WAIT_2FA, WAIT_LINK, WAIT_COUNT = range(6)
-
-# ─── IN-MEMORY STORAGE ─────────────────────────────────────────────────────────
-pending_clients = {}   # phone → TelegramClient (login চলাকালীন)
-active_clients  = {}   # phone → TelegramClient (ready)
-call_instances  = {}   # phone → PyTgCalls instance
-live_sessions   = {}   # bot_chat_id → {phones, chat_peer, link}
-
-# ─── SILENT AUDIO GENERATION ───────────────────────────────────────────────────
-def ensure_silent_audio():
-    """
-    একটা silent raw PCM file তৈরি করে।
-    pytgcalls এটাকে stream করে — real UDP connection open হয়,
-    কিন্তু কোনো sound নেই। Telegram মনে করে real user আছে।
-    """
-    if not os.path.exists(SILENT_AUDIO):
-        logging.info("[AUDIO] Generating silent audio file...")
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-f", "lavfi",
-            "-i", "anullsrc=r=48000:cl=stereo",
-            "-t", "7200",          # 2 ঘণ্টার silent audio
-            "-f", "s16le",         # raw PCM format
-            "-acodec", "pcm_s16le",
-            SILENT_AUDIO
-        ], capture_output=True)
-        logging.info("[AUDIO] Silent audio ready.")
 
 # ─── STORAGE ───────────────────────────────────────────────────────────────────
 def load_accounts():
@@ -81,6 +66,15 @@ def save_accounts(data):
     with open(ACCOUNTS_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
+# In-memory
+pending_clients = {}  # phone → client (login চলাকালীন)
+active_clients  = {}  # phone → client (ready)
+live_sessions   = {}  # bot chat_id → session info
+live_handlers   = {}  # phone → [handler functions]
+call_engines    = {}  # phone → PyTgCalls (real UDP/WebRTC engine)
+watchdog_tasks  = {}  # phone → asyncio.Task (4-sec check + auto-rejoin)
+live_state      = {}  # phone → {engine, chat_id, call, client, me}
+
 # ─── HELPERS ───────────────────────────────────────────────────────────────────
 def main_kb():
     return ReplyKeyboardMarkup([
@@ -91,7 +85,7 @@ def main_kb():
 def is_owner(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == OWNER_ID)
 
-async def get_telethon_client(phone: str, session_str: str) -> TelegramClient:
+async def get_client(phone: str, session_str: str) -> TelegramClient:
     if phone in active_clients:
         c = active_clients[phone]
         if not c.is_connected():
@@ -276,24 +270,137 @@ async def got_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["join_count"] = n
     return await _do_join(update, ctx)
 
+async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    link    = ctx.user_data["live_link"]
+    count   = ctx.user_data["join_count"]
+    accs    = load_accounts()
+    phones  = list(accs.keys())[:count]
+    chat_id = update.effective_chat.id
+
+    msg = await update.message.reply_text(
+        f"⏳ *{count}টি* অ্যাকাউন্ট Join হচ্ছে...",
+        parse_mode="Markdown"
+    )
+
+    joined    = []
+    calls_map = {}
+
+    for phone in phones:
+        info = accs.get(phone)
+        if not info: continue
+        try:
+            client = await get_client(phone, info["session"])
+
+            # ── Step 1: Resolve entity & join channel ──────────────────
+            entity = await _resolve_and_join(client, link)
+            if entity is None:
+                logging.warning(f"[{phone}] Could not resolve entity for {link}")
+                continue
+
+            # ── Step 2: Get active group call ──────────────────────────
+            # Channel vs Group এর জন্য আলাদা request
+            try:
+                if isinstance(entity, Channel):
+                    full = await client(GetFullChannelRequest(entity))
+                else:
+                    # Regular group/supergroup
+                    full = await client(GetFullChatRequest(entity.id))
+                call = getattr(full.full_chat, 'call', None)
+            except Exception as e:
+                logging.warning(f"[{phone}] Could not get full chat: {e}")
+                # Fallback: try the other request type
+                try:
+                    full = await client(GetFullChatRequest(entity.id))
+                    call = getattr(full.full_chat, 'call', None)
+                except Exception:
+                    call = None
+
+            if call is None:
+                logging.warning(f"[{phone}] No active voice/live chat at {link}")
+                continue
+
+            # ── Step 3: Real UDP/WebRTC দিয়ে live join (যেমন আসল human) ─
+            me     = await client.get_me()
+            engine = await _get_engine(phone, client)
+            vchat = get_peer_id(entity)
+
+            await _engine_join(phone, engine, vchat, call, me, client)
+
+            # ── Step 4: Register auto-remute + kick-detect handler ──────
+            handler = _make_remute_handler(client, call, me.id, phone)
+            client.add_event_handler(handler, events.Raw(UpdateGroupCallParticipants))
+            live_handlers.setdefault(phone, []).append(handler)
+
+            # ── Step 5: Watchdog (প্রতি 4 সেকেন্ড চেক, drop হলে ফিরে যাবে) ─
+            state = {
+                "engine":  engine,
+                "chat_id": vchat,
+                "call":    call,
+                "client":  client,
+                "me":      me,
+            }
+            live_state[phone] = state
+            _start_watchdog(phone, state)
+
+            calls_map[phone] = call
+            joined.append(phone)
+            logging.info(f"[{phone}] ✅ Joined live via REAL UDP engine")
+
+        except Exception as e:
+            logging.error(f"[{phone}] Live join failed: {e}")
+
+    if not joined:
+        await msg.edit_text(
+            "❌ *Join করা সম্ভব হয়নি।*\n\n"
+            "সম্ভাব্য কারণ:\n"
+            "• Channel এ Active voice/live chat নেই\n"
+            "• Link ভুল অথবা access নেই",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[]])
+        )
+        await update.message.reply_text("Main menu 👇", reply_markup=main_kb())
+        return MAIN_MENU
+
+    live_sessions[chat_id] = {
+        "phones": joined,
+        "calls":  calls_map,
+        "link":   link,
+    }
+
+    await msg.edit_text(
+        f"✅ *YOUR ACCOUNT LIVE JOIN SUCCESS* 🎉\n\n"
+        f"✔️ Joined : *{len(joined)}* accounts\n"
+        f"❌ Failed : *{count - len(joined)}* accounts\n\n"
+        f"📡 Real UDP connection চালু — এখন auto-leave হবে না",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔴 LIVE LEAVE", callback_data=f"leave:{chat_id}")
+        ]])
+    )
+    return MAIN_MENU
+
 async def _resolve_and_join(client: TelegramClient, link: str):
-    """Channel resolve করো এবং join করো, chat peer return করো।"""
+    """Resolve link → join if needed → return entity (or None)."""
     try:
         if "t.me/+" in link or "joinchat/" in link:
+            # ── Private invite link ────────────────────────────────────
             invite_hash = (
-                link.split("/+")[-1] if "/+" in link
+                link.split("/+")[-1]     if "/+" in link
                 else link.split("joinchat/")[-1]
             ).strip()
             try:
                 check = await client(CheckChatInviteRequest(invite_hash))
+                # Already a member if 'chat' attribute present
                 if hasattr(check, 'chat'):
                     return check.chat
+                # Not yet joined
                 result = await client(ImportChatInviteRequest(invite_hash))
                 return result.chats[0] if result.chats else None
             except Exception:
                 result = await client(ImportChatInviteRequest(invite_hash))
                 return result.chats[0] if result.chats else None
         else:
+            # ── Public username / link ─────────────────────────────────
             username = (
                 link
                 .replace("https://", "")
@@ -304,6 +411,7 @@ async def _resolve_and_join(client: TelegramClient, link: str):
                 .split("/")[0]
             )
             entity = await client.get_entity(username)
+            # Join silently if not already a member
             try:
                 await client(JoinChannelRequest(entity))
             except Exception:
@@ -313,95 +421,112 @@ async def _resolve_and_join(client: TelegramClient, link: str):
         logging.error(f"[RESOLVE] {link} → {e}")
         return None
 
-async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    link    = ctx.user_data["live_link"]
-    count   = ctx.user_data["join_count"]
-    accs    = load_accounts()
-    phones  = list(accs.keys())[:count]
-    bot_chat_id = update.effective_chat.id
-
-    msg = await update.message.reply_text(
-        f"⏳ *{count}টি* অ্যাকাউন্ট Join হচ্ছে...",
-        parse_mode="Markdown"
-    )
-
-    joined     = []
-    chat_peers = {}
-
-    for phone in phones:
-        info = accs.get(phone)
-        if not info:
-            continue
-        try:
-            # ── Step 1: Telethon client নাও ──────────────────────────
-            telethon_client = await get_telethon_client(phone, info["session"])
-
-            # ── Step 2: Channel resolve ও join ───────────────────────
-            entity = await _resolve_and_join(telethon_client, link)
-            if entity is None:
-                logging.warning(f"[{phone}] Could not resolve entity")
+def _make_remute_handler(client: TelegramClient, call, me_id: int, phone: str = None):
+    """
+    - admin unmute করলে সাথে সাথে আবার auto-mute
+    - account live থেকে বের হয়ে গেলে (left=True) log করে → watchdog ফিরে ঢুকাবে
+    """
+    async def handler(ev):
+        for p in ev.participants:
+            uid = getattr(p.peer, 'user_id', None)
+            if uid != me_id:
                 continue
+            if getattr(p, "left", False):
+                logging.warning(f"[KICKED] {phone} live থেকে বের হয়েছে → watchdog ফিরে ঢুকাবে")
+                continue
+            if not p.muted:
+                try:
+                    await client(EditGroupCallParticipantRequest(
+                        call=call,
+                        participant=InputPeerSelf(),
+                        muted=True,
+                    ))
+                    logging.info(f"[AUTO-MUTE] Re-muted user {me_id}")
+                except Exception as ex:
+                    logging.warning(f"[AUTO-MUTE] Failed for {me_id}: {ex}")
+    return handler
 
-            # chat_id বের করো
-            chat_id = entity.id
+# ─── REAL UDP CALL ENGINE (আসল human-এর মতো live-এ থাকে) ───────────────────────
+async def _get_engine(phone: str, client: TelegramClient) -> PyTgCalls:
+    """প্রতিটি account-এর জন্য একটি করে ntgcalls engine (real WebRTC/UDP)"""
+    eng = call_engines.get(phone)
+    if eng is None:
+        eng = PyTgCalls(client, workers=2)
+        call_engines[phone] = eng
+    if not eng._is_running:
+        await eng.start()
+    return eng
 
-            # ── Step 3: PyTgCalls instance তৈরি ──────────────────────
-            # প্রতিটা account-এর জন্য আলাদা PyTgCalls instance
-            if phone not in call_instances:
-                call_py = PyTgCalls(telethon_client)
-                await call_py.start()
-                call_instances[phone] = call_py
-            else:
-                call_py = call_instances[phone]
+async def _engine_join(phone: str, engine: PyTgCalls, chat_id: int,
+                       call, me, client: TelegramClient):
+    """Real UDP/WebRTC connection দিয়ে live-এ ঢোকায় (muted থাকে)"""
+    await engine.play(chat_id, None, config=GroupCallConfig(auto_start=False))
+    try:
+        await engine.mute(chat_id)              # মাইক বন্ধ
+    except Exception as e:
+        logging.warning(f"[{phone}] engine mute: {e}")
+    try:
+        await client(EditGroupCallParticipantRequest(  # লিস্টেও muted
+            call=call, participant=InputPeerSelf(), muted=True))
+    except Exception as e:
+        logging.warning(f"[{phone}] mtproto mute: {e}")
+    logging.info(f"[{phone}] ✅ ঢুকেছে REAL UDP call-এ (muted)")
 
-            # ── Step 4: Silent audio stream দিয়ে join ────────────────
-            # এটাই real UDP connection তৈরি করে
-            # Telegram server মনে করে genuine audio client আছে
-            await call_py.join_group_call(
-                chat_id,
-                AudioPiped(
-                    SILENT_AUDIO,
-                    AudioQuality.STUDIO,
-                ),
-                stream_type=StreamType().pulse_stream,
-            )
+async def _conn_ok(engine: PyTgCalls, chat_id: int) -> bool:
+    """engine এখনো call-এ আছে কিনা (UDP connection সহ)"""
+    try:
+        if chat_id not in await engine._binding.calls():
+            return False
+        st = engine._binding.get_state(chat_id)
+        if asyncio.iscoroutine(st) or hasattr(st, "__await__"):
+            st = await st
+        return "CONNECT" in str(getattr(st, "name", st)).upper()
+    except Exception:
+        return True   # যাচাই করতে না পারলে হস্তক্ষেপ করবে না
 
-            chat_peers[phone] = chat_id
-            joined.append(phone)
-            logging.info(f"[{phone}] ✅ Joined live via PyTgCalls (real UDP)")
-
+async def _watchdog_loop(phone: str, state: dict):
+    """
+    প্রতি KEEPALIVE_INTERVAL (ডিফল্ট 4) সেকেন্ড পর পর চেক করে —
+    connection drop হলে নিজে থেকেই আবার live-এ ঢুকে দেয়।
+    """
+    checks = 0
+    logging.info(f"[WATCHDOG] {phone} 🟢 started (every {KEEPALIVE_INTERVAL}s)")
+    while True:
+        try:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            if await _conn_ok(state["engine"], state["chat_id"]):
+                checks += 1
+                if checks % 15 == 0:  # ~1 মিনিট পর confirmation
+                    logging.info(f"[WATCHDOG] {phone} ✅ live-এ আছে ({checks} checks)")
+                continue
+            logging.warning(f"[WATCHDOG] {phone} 🔄 connection গেছে → আবার join হচ্ছে")
+            try:
+                await state["engine"].leave_call(state["chat_id"])
+            except Exception:
+                pass
+            await _engine_join(phone, state["engine"], state["chat_id"],
+                               state["call"], state["me"], state["client"])
+        except asyncio.CancelledError:
+            logging.info(f"[WATCHDOG] {phone} ⛔ stopped")
+            raise
+        except NoActiveGroupCall:
+            logging.warning(f"[WATCHDOG] {phone} ⛔ live শেষ (call নেই) → watchdog বন্ধ")
+            break
         except Exception as e:
-            logging.error(f"[{phone}] Live join failed: {e}")
+            logging.warning(f"[WATCHDOG] {phone} ⚠️ {e}")
+            try:
+                await asyncio.sleep(KEEPALIVE_INTERVAL)
+            except asyncio.CancelledError:
+                raise
 
-    if not joined:
-        await msg.edit_text(
-            "❌ *Join করা সম্ভব হয়নি।*\n\n"
-            "সম্ভাব্য কারণ:\n"
-            "• Channel এ Active voice/live chat নেই\n"
-            "• Link ভুল অথবা access নেই\n"
-            "• ffmpeg ইনস্টল নেই",
-            parse_mode="Markdown"
-        )
-        await update.message.reply_text("Main menu 👇", reply_markup=main_kb())
-        return MAIN_MENU
+def _start_watchdog(phone: str, state: dict):
+    _stop_watchdog(phone)
+    watchdog_tasks[phone] = asyncio.create_task(_watchdog_loop(phone, state))
 
-    live_sessions[bot_chat_id] = {
-        "phones":     joined,
-        "chat_peers": chat_peers,
-        "link":       link,
-    }
-
-    await msg.edit_text(
-        f"✅ *YOUR ACCOUNT LIVE JOIN SUCCESS* 🎉\n\n"
-        f"✔️ Joined : *{len(joined)}* accounts\n"
-        f"❌ Failed : *{count - len(joined)}* accounts\n\n"
-        f"🔵 Real UDP stream active — always থাকবে",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔴 LIVE LEAVE", callback_data=f"leave:{bot_chat_id}")
-        ]])
-    )
-    return MAIN_MENU
+def _stop_watchdog(phone: str):
+    task = watchdog_tasks.pop(phone, None)
+    if task and not task.done():
+        task.cancel()
 
 # ─── LIVE LEAVE CALLBACK ────────────────────────────────────────────────────────
 async def live_leave_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -412,8 +537,8 @@ async def live_leave_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("⛔ Only owner!", show_alert=True)
         return
 
-    bot_chat_id = int(q.data.split(":")[1])
-    session     = live_sessions.get(bot_chat_id)
+    chat_id = int(q.data.split(":")[1])
+    session = live_sessions.get(chat_id)
 
     if not session:
         await q.edit_message_text("⚠️ কোনো active session নেই।")
@@ -422,20 +547,39 @@ async def live_leave_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("⏳ সব অ্যাকাউন্ট Leave হচ্ছে...")
 
     left = 0
+    accs = load_accounts()
+
     for phone in session["phones"]:
-        chat_id = session["chat_peers"].get(phone)
-        call_py = call_instances.get(phone)
-        if not call_py or not chat_id:
+        # আগেই watchdog বন্ধ করো, নাহলে leave করার পরেও আবার ঢুকে দেবে
+        _stop_watchdog(phone)
+        st     = live_state.pop(phone, {})
+        engine = st.get("engine")
+        vchat  = st.get("chat_id")
+        call   = session["calls"].get(phone)
+        info   = accs.get(phone)
+        if not info:
             continue
         try:
-            await call_py.leave_group_call(chat_id)
+            client = await get_client(phone, info["session"])
+            # Remove auto-remute handlers first
+            for h in live_handlers.pop(phone, []):
+                try:
+                    client.remove_event_handler(h)
+                except Exception:
+                    pass
+            # Leave the call
+            if engine is not None and vchat is not None:
+                try:
+                    await engine.leave_call(vchat)
+                except NotInCallError:
+                    pass
+            elif call:
+                await client(LeaveGroupCallRequest(call=call, source=0))
             left += 1
-            logging.info(f"[{phone}] ✅ Left live")
         except Exception as e:
             logging.error(f"[LEAVE] {phone}: {e}")
 
-    del live_sessions[bot_chat_id]
-
+    del live_sessions[chat_id]
     await q.edit_message_text(
         f"✅ *{left}টি* অ্যাকাউন্ট Live Leave করেছে।",
         parse_mode="Markdown"
@@ -448,9 +592,6 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── MAIN ───────────────────────────────────────────────────────────────────────
 async def main():
-    # Silent audio file তৈরি করো (একবারই করবে)
-    ensure_silent_audio()
-
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -472,8 +613,9 @@ async def main():
     print("🤖 Bot starting...")
     async with app:
         await app.initialize()
+        # পুরনো webhook ও pending updates পরিষ্কার করো
         await app.bot.delete_webhook(drop_pending_updates=True)
-        await asyncio.sleep(1)
+        await asyncio.sleep(1)  # পুরনো instance বন্ধ হওয়ার জন্য অপেক্ষা
         await app.start()
         await app.updater.start_polling(
             drop_pending_updates=True,
@@ -483,12 +625,10 @@ async def main():
         try:
             await asyncio.Event().wait()
         finally:
-            # সব PyTgCalls instance বন্ধ করো
-            for phone, call_py in list(call_instances.items()):
-                try:
-                    await call_py.stop()
-                except Exception:
-                    pass
+            # বন্ধ হওয়ার সময় সব watchdog task বন্ধ
+            for ph in list(watchdog_tasks):
+                _stop_watchdog(ph)
+            live_state.clear()
 
 if __name__ == "__main__":
     asyncio.run(main())
