@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import logging
+import time
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -434,6 +435,8 @@ async def _resolve_and_join(client: TelegramClient, link: str):
         logging.error(f"[RESOLVE] {link} → {e}")
         return None
 
+_last_mute_at: dict = {}   # flood-wait এড়াতে: সাম্প্রতিক auto-mute মনে রাখে
+
 def _make_remute_handler(client: TelegramClient, call, me_id: int, phone: str = None):
     """
     - admin unmute করলে সাথে সাথে আবার auto-mute
@@ -448,6 +451,10 @@ def _make_remute_handler(client: TelegramClient, call, me_id: int, phone: str = 
                 logging.warning(f"[KICKED] {phone} live থেকে বের হয়েছে → watchdog ফিরে ঢুকাবে")
                 continue
             if not p.muted:
+                now = time.monotonic()
+                if now - _last_mute_at.get(me_id, 0) < 60:
+                    continue   # ১ মিনিটের মধ্যে mute করা হয়েছে — flood-wait এড়াতে
+                _last_mute_at[me_id] = now
                 try:
                     await client(EditGroupCallParticipantRequest(
                         call=call,
@@ -519,15 +526,21 @@ async def _get_engine(phone: str, client: TelegramClient) -> PyTgCalls:
 async def _engine_join(phone: str, engine: PyTgCalls, chat_id: int,
                        call, me, client: TelegramClient):
     """Real UDP/WebRTC connection দিয়ে live-এ ঢোকায় (muted থাকে)"""
-    # join_as সবসময় স্পষ্ট দিন — না দিলে cache clear হলে NoneType error আসে
+    # join_as সবসময় InputPeer দিন (full User দিলে pytgcalls-এর internal
+    # chat_id() ভেঙে 'User object has no attribute chat_id' আসে) —
+    # InputPeer দিলে cache clear হলেও NoneType error আসে না
+    try:
+        join_as = await client.get_input_entity(me)
+    except Exception:
+        join_as = me
     try:
         # raw stream — ffprobe/ffmpeg লাগে না (ntgcalls নিজে ফাইল পড়ে, loop করে)
         await engine.play(chat_id, _silence_stream(),
-                          config=GroupCallConfig(join_as=me, auto_start=False))
+                          config=GroupCallConfig(join_as=join_as, auto_start=False))
     except Exception as e:
         logging.warning(f"[{phone}] silent stream failed ({e}) → media ছাড়া join")
         await engine.play(chat_id, None,
-                          config=GroupCallConfig(join_as=me, auto_start=False))
+                          config=GroupCallConfig(join_as=join_as, auto_start=False))
     try:
         await engine.mute(chat_id)              # মাইক বন্ধ
     except Exception as e:
@@ -540,15 +553,14 @@ async def _engine_join(phone: str, engine: PyTgCalls, chat_id: int,
     logging.info(f"[{phone}] ✅ ঢুকেছে REAL UDP call-এ (muted)")
 
 async def _conn_state(engine: PyTgCalls, chat_id: int):
-    """(in_call, state_name) — engine call-এ আছে কিনা আর connection state"""
+    """(in_call, info) — engine-এর public API দিয়ে যাচাই: call-এ আছে কিনা।
+    (নোট: _binding.get_state() MediaState object ফেরায় — connection state না,
+    তাই সেটা দিয়ে disconnected বোঝা যায় না)"""
     try:
-        in_call = chat_id in await engine._binding.calls()
-        if not in_call:
+        calls = await engine.calls          # {chat_id: Call} — public API
+        if chat_id not in calls:
             return False, "NOT_IN_CALL"
-        st = engine._binding.get_state(chat_id)
-        if asyncio.iscoroutine(st) or hasattr(st, "__await__"):
-            st = await st
-        return True, str(getattr(st, "name", st)).upper()
+        return True, "OK"
     except Exception:
         return True, "UNKNOWN"   # যাচাই করতে না পারলে হস্তক্ষেপ করবে না
 
@@ -564,7 +576,7 @@ async def _watchdog_loop(phone: str, state: dict):
         try:
             await asyncio.sleep(KEEPALIVE_INTERVAL)
             in_call, st_name = await _conn_state(state["engine"], state["chat_id"])
-            if in_call and ("CONNECT" in st_name or st_name == "UNKNOWN"):
+            if in_call:
                 checks += 1
                 if checks % 15 == 0:  # ~1 মিনিট পর confirmation
                     logging.info(f"[WATCHDOG] {phone} ✅ live-এ আছে ({checks} checks)")
