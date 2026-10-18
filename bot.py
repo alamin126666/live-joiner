@@ -526,11 +526,12 @@ async def _get_engine(phone: str, client: TelegramClient) -> PyTgCalls:
 async def _engine_join(phone: str, engine: PyTgCalls, chat_id: int,
                        call, me, client: TelegramClient):
     """Real UDP/WebRTC connection দিয়ে live-এ ঢোকায় (muted থাকে)"""
-    # join_as সবসময় InputPeer দিন (full User দিলে pytgcalls-এর internal
-    # chat_id() ভেঙে 'User object has no attribute chat_id' আসে) —
-    # InputPeer দিলে cache clear হলেও NoneType error আসে না
+    # join_as সবসময় InputPeerUser দিন (full User বা InputPeerSelf দিলে
+    # pytgcalls-এর internal chat_id() ভেঙে error আসে) — cache clear হলেও
+    # NoneType error আসে না
     try:
-        join_as = await client.get_input_entity(me)
+        from telethon.tl.types import InputPeerUser
+        join_as = InputPeerUser(user_id=me.id, access_hash=me.access_hash)
     except Exception:
         join_as = me
     try:
