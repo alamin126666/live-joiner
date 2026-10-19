@@ -86,6 +86,31 @@ def main_kb():
 def is_owner(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == OWNER_ID)
 
+# ─── ADMIN SYSTEM (owner নিজে admin দিতে পারবেন /add, বাদ দিতে পারবেন /rm) ───
+ADMIN_FILE = "admins.json"
+
+def load_admins():
+    if os.path.exists(ADMIN_FILE):
+        try:
+            with open(ADMIN_FILE) as f:
+                return set(int(x) for x in json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+def save_admins(ids):
+    with open(ADMIN_FILE, "w") as f:
+        json.dump(sorted(ids), f, indent=2)
+
+admins = load_admins()   # persistent: restart-এও থাকবে
+
+def is_admin_user(uid: int) -> bool:
+    return uid == OWNER_ID or uid in admins
+
+def is_admin(update: Update) -> bool:
+    u = update.effective_user
+    return bool(u and is_admin_user(u.id))
+
 async def get_client(phone: str, session_str: str) -> TelegramClient:
     if phone in active_clients:
         c = active_clients[phone]
@@ -99,8 +124,8 @@ async def get_client(phone: str, session_str: str) -> TelegramClient:
 
 # ─── /start ────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Only owner allowed.")
+    if not is_admin(update):
+        await update.message.reply_text("⛔ Only owner/admin allowed.")
         return ConversationHandler.END
     await update.message.reply_text(
         "👋 *Welcome to Account Manager Bot!*\n\nChoose an option 👇",
@@ -111,7 +136,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── MAIN MENU ROUTER ──────────────────────────────────────────────────────────
 async def menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not is_admin(update):
         return ConversationHandler.END
     t = update.message.text or ""
     if "➕" in t:
@@ -135,7 +160,7 @@ async def add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return WAIT_PHONE
 
 async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update): return ConversationHandler.END
+    if not is_admin(update): return ConversationHandler.END
     phone = update.message.text.strip().replace(" ", "")
     ctx.user_data["phone"] = phone
 
@@ -162,7 +187,7 @@ async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
 
 async def got_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update): return ConversationHandler.END
+    if not is_admin(update): return ConversationHandler.END
     phone  = ctx.user_data.get("phone")
     client = pending_clients.get(phone)
     if not client:
@@ -187,7 +212,7 @@ async def got_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
 
 async def got_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update): return ConversationHandler.END
+    if not is_admin(update): return ConversationHandler.END
     phone  = ctx.user_data.get("phone")
     client = pending_clients.get(phone)
     if not client:
@@ -242,7 +267,7 @@ async def live_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return WAIT_LINK
 
 async def got_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update): return ConversationHandler.END
+    if not is_admin(update): return ConversationHandler.END
     link = update.message.text.strip()
     ctx.user_data["live_link"] = link
     accs = load_accounts()
@@ -260,7 +285,7 @@ async def got_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return WAIT_COUNT
 
 async def got_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update): return ConversationHandler.END
+    if not is_admin(update): return ConversationHandler.END
     accs = load_accounts()
     try:
         n = int(update.message.text.strip())
@@ -625,8 +650,8 @@ async def live_leave_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    if q.from_user.id != OWNER_ID:
-        await q.answer("⛔ Only owner!", show_alert=True)
+    if not is_admin_user(q.from_user.id):
+        await q.answer("⛔ Only owner/admin!", show_alert=True)
         return
 
     chat_id = int(q.data.split(":")[1])
@@ -678,6 +703,73 @@ async def live_leave_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 # ─── CANCEL ─────────────────────────────────────────────────────────────────────
+# ─── ADMIN MANAGEMENT (শুধু owner ব্যবহার করতে পারবেন) ──────────────────────────
+async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """ /add user_id — অন্য কাউকে admin বানাবে (owner-এর মতো বট ব্যবহার করতে পারবে) """
+    if not is_owner(update):
+        await update.message.reply_text("⛔ এই কমান্ড শুধুই Owner ব্যবহার করতে পারবেন।")
+        return
+    if not ctx.args:
+        await update.message.reply_text(
+            "📖 *ব্যবহার:* `/add user_id`\n"
+            "উদাহরণ: `/add 123456789`\n\n"
+            "user_id জানতে যাকে admin দিতে চান, তাকে @userinfobot এ "
+            "পাঠান — সেখান থেকে আইডি নিন।",
+            parse_mode="Markdown")
+        return
+    try:
+        uid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id হতে হবে সংখ্যা।")
+        return
+    if uid == OWNER_ID:
+        await update.message.reply_text("⚠️ এটা আপনার নিজের owner ID — এটা আগে থেকেই সবকিছু করতে পারে।")
+        return
+    if uid in admins:
+        await update.message.reply_text(f"⚠️ `{uid}` আগে থেকেই admin।", parse_mode="Markdown")
+        return
+    admins.add(uid)
+    save_admins(admins)
+    await update.message.reply_text(
+        f"✅ *Admin যোগ হয়েছে:* `{uid}`\n\n"
+        "সে এখন আপনার মতোই বটের সব feature (account add, live join/leave) "
+        "ব্যবহার করতে পারবে। /start দিয়ে শুরু করবে।",
+        parse_mode="Markdown")
+
+async def cmd_rm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """ /rm user_id — admin-ship ফিরিয়ে নেবে """
+    if not is_owner(update):
+        await update.message.reply_text("⛔ এই কমান্ড শুধুই Owner ব্যবহার করতে পারবেন।")
+        return
+    if not ctx.args:
+        admins_list = "\n".join(f"• `{a}`" for a in sorted(admins)) or "(কোনো admin নেই)"
+        await update.message.reply_text(
+            "📖 *ব্যবহার:* `/rm user_id`\n\n"
+            "*বর্তমান admins:*\n" + admins_list,
+            parse_mode="Markdown")
+        return
+    try:
+        uid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id হতে হবে সংখ্যা।")
+        return
+    if uid not in admins:
+        await update.message.reply_text(f"⚠️ `{uid}` এখন admin না।", parse_mode="Markdown")
+        return
+    admins.discard(uid)
+    save_admins(admins)
+    await update.message.reply_text(f"🗑️ `{uid}` এর admin-ship নেমে গেছে।", parse_mode="Markdown")
+
+async def cmd_admins(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """ /admins — বর্তমান admin তালিকা দেখাবে (owner ও admin দেখতে পারবে) """
+    if not is_admin(update):
+        return
+    owners = f"👑 Owner: `{OWNER_ID}`\n" if OWNER_ID else "👑 Owner: (set হয়নি)\n"
+    admins_list = "\n".join(f"• `{a}`" for a in sorted(admins)) or "(কোনো admin নেই)"
+    await update.message.reply_text(
+        owners + "\n*Admins:*\n" + admins_list,
+        parse_mode="Markdown")
+
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ বাতিল।", reply_markup=main_kb())
     return MAIN_MENU
@@ -701,6 +793,9 @@ async def main():
     )
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(live_leave_cb, pattern=r"^leave:"))
+    app.add_handler(CommandHandler("add", cmd_add))       # শুধু owner
+    app.add_handler(CommandHandler("rm", cmd_rm))         # শুধু owner
+    app.add_handler(CommandHandler("admins", cmd_admins))
 
     print("🤖 Bot starting...")
     async with app:

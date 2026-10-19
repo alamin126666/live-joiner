@@ -68,6 +68,15 @@ Main menu আসবে তিনটি বাটন সহ:
 3. প্রতিটি account **আসল UDP/WebRTC media connection** দিয়ে join করবে (ntgcalls engine — ঠিক যেমন Telegram app করে), সাথে **muted** থাকবে
 4. **🔴 LIVE LEAVE** বাটন চাপলে সব account leave করবে
 
+### 👑 Admin System (শুধু owner এই কমান্ডগুলো চালাতে পারবেন)
+- `/add user_id` — অন্য কাউকে **admin** বানাবে; সে আপনার মতোই বটের সব feature (account add, live join/leave) ব্যবহার করতে পারবে
+- `/rm user_id` — কারো **admin-ship বাদ** দেবে
+- `/admins` — বর্তমান owner ও admin তালিকা দেখাবে
+
+> ⚠️ `/add` ও `/rm` **শুধু owner** ব্যবহার করতে পারবেন — admin এই দুটো command চালাতে পারবে না।
+> user_id জানতে যাকে admin দিতে চান, তাকে **@userinfobot** এ পাঠান।
+> admin list `admins.json` ফাইলে সেভ থাকে — bot restart হলেও থেকে যাবে।
+
 ---
 
 ## 🛠️ কীভাবে auto-leave ঠেকানো হয়েছে
